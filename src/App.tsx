@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
 import { Icon } from './components/Icon';
 import { Badge, EmptyState, Modal, formatDate, formatDateTime } from './components/UI';
 import { loadDemoDatabase, resetDemoDatabase, saveDemoDatabase } from './data/store';
@@ -7,8 +8,10 @@ import {
   restoreBusiness, revokePaymentVerification, suspendBusiness, verifyManualPayment,
 } from './lib/workflow';
 import type { AdminDatabase, BusinessRequest, Section, ApprovalStatus } from './types';
+import { adminApi, liveAdminEnabled } from './live/adminApi';
 
 const ADMIN_NAME = 'Demo Admin';
+const emptyDatabase = (): AdminDatabase => ({ schemaVersion: 1, requests: [], reports: [], activity: [] });
 const navigation: Array<{ id: Section; label: string; icon: Parameters<typeof Icon>[0]['name'] }> = [
   { id: 'dashboard', label: 'Overview', icon: 'dashboard' },
   { id: 'requests', label: 'Business requests', icon: 'requests' },
@@ -41,7 +44,14 @@ const identity = (id: string) => id.replace(/^demo-/, '');
 const phoneHref = (raw: string) => raw.replace(/[^\d+]/g, '');
 
 function App() {
-  const [db, setDb] = useState<AdminDatabase>(loadDemoDatabase);
+  const [db, setDb] = useState<AdminDatabase>(() => liveAdminEnabled ? emptyDatabase() : loadDemoDatabase());
+  const [connected, setConnected] = useState(false);
+  const [adminEmail, setAdminEmail] = useState('');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [working, setWorking] = useState(false);
+  const [bannerUrls, setBannerUrls] = useState<Record<string, string>>({});
+  const bannerPending = useRef(new Set<string>());
   const [section, setSection] = useState<Section>('dashboard');
   const [filter, setFilter] = useState<'all' | ApprovalStatus>('all');
   const [search, setSearch] = useState('');
@@ -54,7 +64,59 @@ function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
-  useEffect(() => saveDemoDatabase(db), [db]);
+  useEffect(() => { if (!liveAdminEnabled) saveDemoDatabase(db); }, [db]);
+  useEffect(() => {
+    if (!liveAdminEnabled || !connected) return;
+    let active = true;
+    const fetchSnapshot = async () => {
+      try {
+        const next = await adminApi.snapshot();
+        if (active) setDb(next);
+      } catch (e) {
+        if (active) setToast(e instanceof Error ? e.message : 'Connection to Spring Boot failed.');
+      }
+    };
+    void fetchSnapshot();
+    const timer = window.setInterval(() => void fetchSnapshot(), 20000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [connected]);
+  useEffect(() => {
+    if (!liveAdminEnabled || !connected) return;
+    for (const request of db.requests) {
+      if (!request.bannerUrl || bannerUrls[request.id] || bannerPending.current.has(request.id)) continue;
+      const id = request.id;
+      bannerPending.current.add(id);
+      void adminApi.imageBlob(request.bannerUrl).then(url => {
+        setBannerUrls(prev => ({ ...prev, [id]: url }));
+      }).catch(() => {}).finally(() => bannerPending.current.delete(id));
+    }
+  }, [connected, db.requests, bannerUrls]);
+
+  async function refreshLive() {
+    if (liveAdminEnabled && adminApi.signedIn) setDb(await adminApi.snapshot());
+  }
+  async function signInLive(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setWorking(true);
+    setAuthError('');
+    try {
+      await adminApi.login(adminEmail.trim(), adminPassword);
+      setAdminPassword('');
+      setDb(await adminApi.snapshot());
+      setConnected(true);
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : 'Unable to sign in.');
+    } finally { setWorking(false); }
+  }
+  async function signOutLive() {
+    try { await adminApi.logout(); }
+    catch { /* Local logout must work even without network. */ }
+    finally {
+      Object.values(bannerUrls).forEach(url => URL.revokeObjectURL(url));
+      bannerPending.current.clear();
+      setDb(emptyDatabase()); setConnected(false); setBannerUrls({});
+    }
+  }
   useEffect(() => {
     if (!toast) return;
     const t = window.setTimeout(() => setToast(null), 4500);
@@ -116,8 +178,34 @@ function App() {
     setToast(`Demo report ${identity(id)} marked ${decision}.`);
   }
 
+  async function confirmLiveDialog(current: DialogState) {
+    if (current.type === 'reset' || current.type === 'moderate') {
+      setToast('Demo reset and review moderation are unavailable in live mode.');
+      setDialog(null);
+      return;
+    }
+    if (current.type === 'payment' && !paymentAcknowledged) {
+      setToast('Confirm that manual payment was verified independently.');
+      return;
+    }
+    setWorking(true);
+    try {
+      const payload = current.type === 'payment'
+        ? { confirmed: true, reference, note }
+        : (current.type === 'decline' || current.type === 'suspend')
+          ? { reason } : undefined;
+      await adminApi.action(current.id, current.type, payload);
+      await refreshLive();
+      setDialog(null);
+      setToast(`Saved ${current.type} action to Spring Boot.`);
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : 'Admin action failed.');
+    } finally { setWorking(false); }
+  }
+
   function confirmDialog() {
     if (!dialog) return;
+    if (liveAdminEnabled) { void confirmLiveDialog(dialog); return; }
     try {
       if (dialog.type === 'reset') {
         setDb(resetDemoDatabase()); setSelectedId(null); setToast('Demo data restored to its original sample records.');
@@ -150,6 +238,25 @@ function App() {
 
   const openRequest = (id: string) => { setSelectedId(id); setMobileMenuOpen(false); };
 
+  if (liveAdminEnabled && !connected) return <div className="sajha-admin-signin">
+    <form className="sajha-admin-login-card" onSubmit={e => void signInLive(e)}>
+      <div className="sajha-admin-login-brand">SaJHa <span>ADMIN PORTAL</span></div>
+      <h1>Administrator sign in</h1>
+      <p>Use an account granted the ADMIN role in your local Spring Boot database.</p>
+      <label htmlFor="admin-email">Email</label>
+      <input id="admin-email" className="form-control" type="email" autoComplete="username"
+        required value={adminEmail} onChange={e => setAdminEmail(e.target.value)} />
+      <label htmlFor="admin-password">Password</label>
+      <input id="admin-password" className="form-control" type="password" autoComplete="current-password"
+        required value={adminPassword} onChange={e => setAdminPassword(e.target.value)} />
+      {authError && <p role="alert" className="sajha-admin-login-error">{authError}</p>}
+      <button className="btn btn-primary" disabled={working} type="submit">
+        {working ? 'Signing in…' : 'Sign in securely'}
+      </button>
+      <small>Tokens remain in browser memory only. Closing or refreshing this page signs you out.</small>
+    </form>
+  </div>;
+
   return <div className="app-shell">
     {mobileMenuOpen && <button className="mobile-scrim" aria-label="Close menu" onClick={() => setMobileMenuOpen(false)} />}
     <aside className={`sidebar ${mobileMenuOpen ? 'sidebar-open' : ''}`}>
@@ -163,23 +270,23 @@ function App() {
           {item.id === 'reports' && openReports.length > 0 && <span className="side-count">{openReports.length}</span>}
         </button>)}
       </nav>
-      <div className="sidebar-bottom"><div className="demo-admin-avatar">DA</div><div><strong>Demo Administrator</strong><small>Frontend preview · No login</small></div></div>
+      <div className="sidebar-bottom"><div className="demo-admin-avatar">{liveAdminEnabled ? 'SA' : 'DA'}</div><div><strong>{liveAdminEnabled ? adminApi.name : 'Demo Administrator'}</strong><small>{liveAdminEnabled ? 'Authenticated admin · Spring Boot' : 'Frontend preview · No login'}</small></div></div>
     </aside>
 
     <div className="main-column">
       <header className="topbar">
         <div className="topbar-left"><button className="icon-button menu-toggle" aria-label="Open menu" onClick={() => setMobileMenuOpen(true)}><Icon name="menu" /></button><div className="breadcrumb">SaJHa <span>/</span> <strong>{titles[section].title}</strong></div></div>
-        <div className="topbar-right"><span className="demo-pill"><span/> Demo mode</span><div className="avatar-mini">DA</div></div>
+        <div className="topbar-right"><span className="demo-pill"><span/> {liveAdminEnabled ? 'Connected' : 'Demo mode'}</span>{liveAdminEnabled && <button className="btn btn-outline btn-sm" onClick={() => void signOutLive()}>Sign out</button>}<div className="avatar-mini">{liveAdminEnabled ? 'SA' : 'DA'}</div></div>
       </header>
       <main className="page">
-        <div className="demo-notice"><Icon name="info" size={19}/><span><strong>Local frontend preview.</strong> Data is sample-only and saved in this browser. No Flutter app, backend, payment system, or real administrator is connected.</span></div>
+        <div className="demo-notice"><Icon name="info" size={19}/><span>{liveAdminEnabled ? <><strong>Connected to Spring Boot.</strong> Business submissions and decisions are stored in MySQL. Manual payment confirmation is an administrative record, not a transaction. Review moderation is not yet connected.</> : <><strong>Local frontend preview.</strong> Data is sample-only and saved in this browser. No Flutter app, backend, payment system, or real administrator is connected.</>}</span></div>
         <div className="page-heading"><div><h1>{titles[section].title}</h1><p>{titles[section].subtitle}</p></div>
           {section === 'dashboard' && <button className="btn btn-primary" onClick={() => go('requests')}><Icon name="requests" size={17}/> Review requests</button>}
         </div>
 
         {section === 'dashboard' && <>
           <div className="stats-grid">
-            <Stat title="Total requests" value={db.requests.length} icon="requests" tone="navy" caption="All submitted previews"/>
+            <Stat title="Total requests" value={db.requests.length} icon="requests" tone="navy" caption={liveAdminEnabled ? 'Stored requests' : 'All submitted previews'}/>
             <Stat title="Pending review" value={pending.length} icon="clock" tone="orange" caption="Need admin action"/>
             <Stat title="Approved" value={approved.length} icon="check" tone="green" caption={`${published.length} currently visible`}/>
             <Stat title="Open reports" value={openReports.length} icon="flag" tone="purple" caption="Need moderation"/>
@@ -194,7 +301,7 @@ function App() {
               <div className="small-callout"><Icon name="card" size={20}/><div><strong>Payments stay manual</strong><p>Record confirmation only after contacting the owner and verifying payment outside SaJHa.</p></div></div>
             </section>
           </div>
-          <section className="panel"><div className="panel-header"><div><h2>Recent activity</h2><p>Actions recorded in this browser</p></div><button className="text-button" onClick={() => go('activity')}>View history <Icon name="arrow" size={15}/></button></div>
+          <section className="panel"><div className="panel-header"><div><h2>Recent activity</h2><p>{liveAdminEnabled ? 'Backend audit history' : 'Actions recorded in this browser'}</p></div><button className="text-button" onClick={() => go('activity')}>View history <Icon name="arrow" size={15}/></button></div>
             <div className="activity-list">{newestActivity.slice(0, 4).map(a => <ActivityRow key={a.id} event={a}/>)}</div></section>
         </>}
 
@@ -208,7 +315,7 @@ function App() {
 
         {section === 'published' && <section className="panel">
           <div className="panel-header"><div><h2>Approved business listings</h2><p>Permanent publication, subject to moderation.</p></div><span className="subtle-count">{published.length} visible / {approved.length} approved</span></div>
-          {approved.length ? <div className="published-grid">{approved.map(r => <div className="published-card" key={r.id}><div className="published-banner">{r.bannerUrl && <img className="cover-image" src={r.bannerUrl} alt="Business banner" />}<BusinessGlyph name={r.businessName} category={r.category}/><Badge status={r.status} visibility={r.visibility}/></div><div className="published-body"><strong>{r.businessName}</strong><p>{r.category}</p><div className="published-meta"><Icon name="pin" size={15}/>{r.onlineOnly ? 'Online only' : r.city || r.address}</div><div className="published-actions"><button className="btn btn-outline btn-sm" onClick={() => openRequest(r.id)}>View details</button>{r.visibility === 'active' ? <button className="btn btn-subtle btn-sm" onClick={() => openDialog({ type: 'suspend', id: r.id })}>Suspend</button> : <button className="btn btn-outline btn-sm" onClick={() => openDialog({ type: 'restore', id: r.id })}>Restore</button>}</div></div></div>)}</div>
+          {approved.length ? <div className="published-grid">{approved.map(r => <div className="published-card" key={r.id}><div className="published-banner">{r.bannerUrl && (!liveAdminEnabled || bannerUrls[r.id]) && <img className="cover-image" src={liveAdminEnabled ? bannerUrls[r.id] : r.bannerUrl} alt="Business banner" />}<BusinessGlyph name={r.businessName} category={r.category}/><Badge status={r.status} visibility={r.visibility}/></div><div className="published-body"><strong>{r.businessName}</strong><p>{r.category}</p><div className="published-meta"><Icon name="pin" size={15}/>{r.onlineOnly ? 'Online only' : r.city || r.address}</div><div className="published-actions"><button className="btn btn-outline btn-sm" onClick={() => openRequest(r.id)}>View details</button>{r.visibility === 'active' ? <button className="btn btn-subtle btn-sm" onClick={() => openDialog({ type: 'suspend', id: r.id })}>Suspend</button> : <button className="btn btn-outline btn-sm" onClick={() => openDialog({ type: 'restore', id: r.id })}>Restore</button>}</div></div></div>)}</div>
             : <EmptyState icon="store" title="No approved businesses" description="Approve a Pending request after recording manual payment verification."/>}
         </section>}
 
@@ -225,23 +332,23 @@ function App() {
         {section === 'activity' && <section className="panel"><div className="panel-header"><div><h2>Admin activity log</h2><p>Frontend-only audit events; not tamper-proof.</p></div><span className="subtle-count">{db.activity.length} events</span></div><div className="activity-list">{newestActivity.map(a => <ActivityRow key={a.id} event={a}/>)}</div></section>}
 
         {section === 'settings' && <div className="settings-grid"><section className="panel"><div className="panel-header"><div><h2>Frontend preview settings</h2><p>Data and permissions in this prototype</p></div></div><div className="settings-content"><div className="settings-line"><Icon name="shield"/><div><strong>Demo-only administration</strong><p>No authentication is configured. Never deploy this preview as a real admin portal.</p></div></div><div className="settings-line"><Icon name="card"/><div><strong>No payment processing</strong><p>Verification is a manual checkbox and note. No bank, payment processor or payment API is connected.</p></div></div><div className="settings-line"><Icon name="store"/><div><strong>No public publication</strong><p>Approved records appear only in this browser, not in Flutter or a public business directory.</p></div></div></div></section>
-          <section className="panel"><div className="panel-header"><div><h2>Reset sample data</h2><p>Start the demo from scratch.</p></div></div><div className="settings-content"><p className="muted">This clears local preview changes and restores the example business requests, manual payment flags, activity log and reports.</p><button className="btn btn-danger" onClick={() => openDialog({ type: 'reset' })}><Icon name="refresh" size={18}/> Reset demo data</button></div></section>
-          <section className="panel"><div className="panel-header"><div><h2>Backend integration</h2><p>Required before production deployment</p></div></div><div className="settings-content"><p className="muted">Spring Boot must authenticate admins, enforce role checks, store submissions and audit logs, verify object permissions, and publish only approved active businesses.</p><p className="muted">API contracts and security requirements are documented in the included <code>API_CONTRACT.md</code>.</p></div></section>
+          <section className="panel"><div className="panel-header"><div><h2>Reset sample data</h2><p>Start the demo from scratch.</p></div></div><div className="settings-content"><p className="muted">This clears local preview changes and restores the example business requests, manual payment flags, activity log and reports.</p><button className="btn btn-danger" disabled={liveAdminEnabled} onClick={() => openDialog({ type: 'reset' })}><Icon name="refresh" size={18}/> Reset demo data</button></div></section>
+          <section className="panel"><div className="panel-header"><div><h2>Backend integration</h2><p>Required before production deployment</p></div></div><div className="settings-content"><p className="muted">{liveAdminEnabled ? 'Business requests, approval history, and access controls are backed by Spring Boot. Customer review moderation is not connected in this milestone.' : 'Spring Boot must authenticate admins, enforce role checks, store submissions and audit logs, verify object permissions, and publish only approved active businesses.'}</p><p className="muted">API contracts and security requirements are documented in the included <code>API_CONTRACT.md</code>.</p></div></section>
         </div>}
       </main>
-      <footer className="footer">SaJHa Admin · Local preview only <span>Community marketplace · 2026</span></footer>
+      <footer className="footer">{liveAdminEnabled ? 'SaJHa Admin · Spring Boot (local testing)' : 'SaJHa Admin · Local preview only'} <span>Community marketplace · 2026</span></footer>
     </div>
 
     {selected && <div className="drawer-overlay" onMouseDown={() => setSelectedId(null)} role="presentation"><aside className="detail-drawer" role="dialog" aria-modal="true" aria-label={`${selected.businessName} request details`} onMouseDown={e => e.stopPropagation()}>
       <div className="drawer-header"><div><span className="eyebrow">BUSINESS REQUEST · {identity(selected.id)}</span><h2>{selected.businessName}</h2></div><button className="icon-button" onClick={() => setSelectedId(null)} aria-label="Close request details"><Icon name="close"/></button></div>
       <div className="drawer-scroll">
-        <div className="detail-hero">{selected.bannerUrl && <img className="cover-image" src={selected.bannerUrl} alt="Submitted business banner" />}<div className="detail-hero-symbol"><Icon name="store" size={38}/></div><Badge status={selected.status} visibility={selected.visibility}/></div>
+        <div className="detail-hero">{selected.bannerUrl && (!liveAdminEnabled || bannerUrls[selected.id]) && <img className="cover-image" src={liveAdminEnabled ? bannerUrls[selected.id] : selected.bannerUrl} alt="Submitted business banner" />}<div className="detail-hero-symbol"><Icon name="store" size={38}/></div><Badge status={selected.status} visibility={selected.visibility}/></div>
         <div className="detail-summary"><p>{selected.category}</p><h3>{selected.businessName}</h3><p>{selected.description}</p></div>
         <div className="detail-section"><h4>Contact information</h4><DetailLine icon="user" title="Owner" value={selected.ownerName}/><DetailLine icon="phone" title="Phone" value={selected.phone}/>{selected.ownerEmail && <DetailLine icon="message" title="Email" value={selected.ownerEmail}/>}{selected.website && <DetailLine icon="globe" title="Website" value={selected.website}/>}<div className="contact-actions"><a className="btn btn-outline btn-sm" href={`tel:${phoneHref(selected.phone)}`}><Icon name="phone" size={16}/> Call owner</a><a className="btn btn-outline btn-sm" href={`sms:${phoneHref(selected.phone)}`}><Icon name="message" size={16}/> Send SMS</a></div></div>
         <div className="detail-section"><h4>Location</h4><DetailLine icon="pin" title="Business location" value={selected.onlineOnly ? 'Online-only business' : selected.address || 'Address not supplied'}/>{selected.latitude != null && selected.longitude != null && <a className="text-link" href={`https://www.openstreetmap.org/?mlat=${selected.latitude}&mlon=${selected.longitude}#map=17/${selected.latitude}/${selected.longitude}`} target="_blank" rel="noopener noreferrer">View coordinates on map <Icon name="external" size={14}/></a>}</div>
         <div className="detail-section"><h4>Opening hours</h4><div className="hours-list">{Object.entries(selected.openingHours).map(([day, h]) => <div key={day}><span>{day}</span><strong>{h}</strong></div>)}</div></div>
         <div className="detail-section"><h4>Submission history</h4><DetailLine icon="calendar" title="Submitted" value={formatDateTime(selected.submittedAt)}/><DetailLine icon="refresh" title="Revision" value={String(selected.revision)}/>{selected.reviewedAt && <DetailLine icon="shield" title="Reviewed" value={`${formatDateTime(selected.reviewedAt)} · ${selected.reviewedBy || 'Admin'}`}/>}{selected.declineReason && <div className="reason-panel"><strong>Decline reason</strong><p>{selected.declineReason}</p></div>}{selected.suspensionReason && <div className="reason-panel"><strong>Suspension reason</strong><p>{selected.suspensionReason}</p></div>}</div>
-        <div className="detail-section payment-section"><h4>Manual payment record</h4><div className={`payment-confirmation ${selected.payment.confirmed ? 'yes' : 'no'}`}><Icon name={selected.payment.confirmed ? 'check' : 'clock'} size={19}/><div><strong>{selected.payment.confirmed ? 'Verified by admin (demo)' : 'Not verified'}</strong><p>{selected.payment.confirmed ? `Recorded ${formatDateTime(selected.payment.checkedAt)}` : 'No external payment confirmation has been recorded.'}</p></div></div>{selected.payment.confirmed && <><DetailLine icon="user" title="Verified by" value={selected.payment.verifiedBy || '—'}/>{selected.payment.reference && <DetailLine icon="file" title="Reference" value={selected.payment.reference}/>}{selected.payment.note && <p className="payment-note">{selected.payment.note}</p>}</>}</div>
+        <div className="detail-section payment-section"><h4>Manual payment record</h4><div className={`payment-confirmation ${selected.payment.confirmed ? 'yes' : 'no'}`}><Icon name={selected.payment.confirmed ? 'check' : 'clock'} size={19}/><div><strong>{selected.payment.confirmed ? (liveAdminEnabled ? 'Verified by admin' : 'Verified by admin (demo)') : 'Not verified'}</strong><p>{selected.payment.confirmed ? `Recorded ${formatDateTime(selected.payment.checkedAt)}` : 'No external payment confirmation has been recorded.'}</p></div></div>{selected.payment.confirmed && <><DetailLine icon="user" title="Verified by" value={selected.payment.verifiedBy || '—'}/>{selected.payment.reference && <DetailLine icon="file" title="Reference" value={selected.payment.reference}/>}{selected.payment.note && <p className="payment-note">{selected.payment.note}</p>}</>}</div>
       </div>
       <div className="drawer-actions">
         {selected.status === 'pending' && <>
@@ -259,9 +366,9 @@ function App() {
         {dialog.type === 'payment' && <><label className="form-label" htmlFor="payment-reference">Optional payment reference</label><input id="payment-reference" className="form-control" maxLength={100} placeholder="e.g., manual invoice reference" value={reference} onChange={e => setReference(e.target.value)} /><label className="form-label" htmlFor="payment-note">Private admin note (optional)</label><textarea id="payment-note" className="form-control" rows={3} maxLength={400} placeholder="No banking details, passwords or card numbers" value={note} onChange={e => setNote(e.target.value)}/><label className="confirm-box"><input type="checkbox" checked={paymentAcknowledged} onChange={e => setPaymentAcknowledged(e.target.checked)}/><span>I personally verified payment outside SaJHa. This is an admin record, not a charge or gateway confirmation.</span></label></>}
         {(dialog.type === 'decline' || dialog.type === 'suspend') && <><label className="form-label" htmlFor="reason">{dialog.type === 'decline' ? 'Reason shown to business owner (required)' : 'Internal suspension reason (required)'}</label><textarea id="reason" className="form-control" rows={4} maxLength={800} value={reason} onChange={e => setReason(e.target.value)} placeholder={dialog.type === 'decline' ? 'Explain what needs correcting...' : 'Why is this business being suspended?'}/><small className="muted">{reason.trim().length} characters</small></>}
         {dialog.type === 'moderate' && <><div className="small-callout"><Icon name="info"/><p>{dialog.decision === 'removed' ? 'This marks the review as removed in the demo report. It does not delete a real Flutter review.' : 'Dismissal closes the demo report without hiding its review.'}</p></div><label className="form-label" htmlFor="moderation-note">Moderation note (required)</label><textarea id="moderation-note" className="form-control" rows={3} maxLength={800} value={note} onChange={e => setNote(e.target.value)} placeholder="Explain your decision..." /></>}
-        {(dialog.type === 'approve' || dialog.type === 'revoke' || dialog.type === 'restore' || dialog.type === 'reset') && <div className="small-callout"><Icon name="alert" size={20}/><p>{dialog.type === 'approve' ? 'This will make the example business Approved and active in this browser only.' : dialog.type === 'revoke' ? 'This will clear the manual payment verification for this Pending request.' : dialog.type === 'restore' ? 'This will restore the example business visibility in this browser.' : 'This will discard all changes saved in this browser and restore sample data.'}</p></div>}
+        {(dialog.type === 'approve' || dialog.type === 'revoke' || dialog.type === 'restore' || dialog.type === 'reset') && <div className="small-callout"><Icon name="alert" size={20}/><p>{dialog.type === 'approve' ? liveAdminEnabled ? 'This will approve and publish the business in MySQL.' : 'This will make the example business Approved and active in this browser only.' : dialog.type === 'revoke' ? 'This will clear the manual payment verification for this Pending request.' : dialog.type === 'restore' ? 'This will restore the example business visibility in this browser.' : 'This will discard all changes saved in this browser and restore sample data.'}</p></div>}
       </div>
-      <div className="modal-actions"><button className="btn btn-outline" onClick={() => setDialog(null)}>Cancel</button><button className={`btn ${['decline','suspend','reset'].includes(dialog.type) ? 'btn-danger' : 'btn-primary'}`} onClick={confirmDialog} disabled={dialog.type === 'payment' && !paymentAcknowledged}>{dialogConfirmLabel(dialog)}</button></div>
+      <div className="modal-actions"><button className="btn btn-outline" onClick={() => setDialog(null)}>Cancel</button><button className={`btn ${['decline','suspend','reset'].includes(dialog.type) ? 'btn-danger' : 'btn-primary'}`} onClick={confirmDialog} disabled={working || (dialog.type === 'payment' && !paymentAcknowledged)}>{dialogConfirmLabel(dialog)}</button></div>
     </Modal>}
 
     {toast && <div className="toast" role="status"><Icon name="info" size={17}/>{toast}<button aria-label="Dismiss notification" onClick={() => setToast(null)}><Icon name="close" size={15}/></button></div>}
@@ -302,7 +409,7 @@ function dialogDescription(d: DialogState): string {
   if (d.type === 'payment') return 'Only record this after independently confirming the off-app payment.';
   if (d.type === 'decline') return 'The reason will be visible to the business owner once backend-connected.';
   if (d.type === 'suspend') return 'Suspension changes visibility; it does not create another approval status.';
-  return 'This action affects demonstration data in this browser only.';
+  return liveAdminEnabled ? 'This administrative decision will be recorded in MySQL.' : 'This action affects demonstration data in this browser only.';
 }
 function dialogConfirmLabel(d: DialogState): string {
   switch (d.type) {
