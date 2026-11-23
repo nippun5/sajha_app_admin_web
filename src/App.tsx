@@ -179,9 +179,21 @@ function App() {
   }
 
   async function confirmLiveDialog(current: DialogState) {
-    if (current.type === 'reset' || current.type === 'moderate') {
-      setToast('Demo reset and review moderation are unavailable in live mode.');
+    if (current.type === 'reset') {
+      setToast('Demo reset is unavailable in live mode.');
       setDialog(null);
+      return;
+    }
+    if (current.type === 'moderate') {
+      setWorking(true);
+      try {
+        await adminApi.moderate(current.id, current.decision, note);
+        await refreshLive();
+        setDialog(null);
+        setToast('Review moderation saved to Spring Boot.');
+      } catch (e) {
+        setToast(e instanceof Error ? e.message : 'Review moderation failed.');
+      } finally { setWorking(false); }
       return;
     }
     if (current.type === 'payment' && !paymentAcknowledged) {
@@ -321,7 +333,7 @@ function App() {
 
         {section === 'reports' && <section className="panel"><div className="panel-header"><div><h2>Reported reviews</h2><p>Inspect and resolve community-submitted reports.</p></div><span className="subtle-count">{openReports.length} open</span></div>
           {db.reports.length ? <div className="report-list">{[...db.reports].sort((a,b) => a.status === b.status ? b.createdAt.localeCompare(a.createdAt) : a.status === 'open' ? -1 : 1).map(r => <div className="report-card" key={r.id}>
-            <div className="report-card-top"><div><strong>{r.businessName}</strong><span className="report-id">{identity(r.id)} · {formatDate(r.createdAt)}</span></div><span className={`report-status ${r.status}`}>{r.status === 'open' ? 'Needs review' : r.status === 'dismissed' ? 'Dismissed' : 'Removed (demo)'}</span></div>
+            <div className="report-card-top"><div><strong>{r.businessName}</strong><span className="report-id">{identity(r.id)} · {formatDate(r.createdAt)}</span></div><span className={`report-status ${r.status}`}>{r.status === 'open' ? 'Needs review' : r.status === 'dismissed' ? 'Dismissed' : 'Removed'}</span></div>
             <div className="review-quote"><div className="stars">{'★'.repeat(r.stars)}{'☆'.repeat(5-r.stars)}</div><p>“{r.reviewText}”</p><small>By {r.reviewer}</small></div>
             <div className="report-reason"><Icon name="flag" size={16}/><span>Reported: <strong>{r.reason}</strong></span></div>
             {r.status === 'open' ? <div className="report-actions"><button className="btn btn-outline btn-sm" onClick={() => openDialog({ type: 'moderate', id: r.id, decision: 'dismissed' })}>Dismiss report</button><button className="btn btn-danger btn-sm" onClick={() => openDialog({ type: 'moderate', id: r.id, decision: 'removed' })}>Mark review removed</button></div>
@@ -365,7 +377,7 @@ function App() {
       <div className="modal-body">
         {dialog.type === 'payment' && <><label className="form-label" htmlFor="payment-reference">Optional payment reference</label><input id="payment-reference" className="form-control" maxLength={100} placeholder="e.g., manual invoice reference" value={reference} onChange={e => setReference(e.target.value)} /><label className="form-label" htmlFor="payment-note">Private admin note (optional)</label><textarea id="payment-note" className="form-control" rows={3} maxLength={400} placeholder="No banking details, passwords or card numbers" value={note} onChange={e => setNote(e.target.value)}/><label className="confirm-box"><input type="checkbox" checked={paymentAcknowledged} onChange={e => setPaymentAcknowledged(e.target.checked)}/><span>I personally verified payment outside SaJHa. This is an admin record, not a charge or gateway confirmation.</span></label></>}
         {(dialog.type === 'decline' || dialog.type === 'suspend') && <><label className="form-label" htmlFor="reason">{dialog.type === 'decline' ? 'Reason shown to business owner (required)' : 'Internal suspension reason (required)'}</label><textarea id="reason" className="form-control" rows={4} maxLength={800} value={reason} onChange={e => setReason(e.target.value)} placeholder={dialog.type === 'decline' ? 'Explain what needs correcting...' : 'Why is this business being suspended?'}/><small className="muted">{reason.trim().length} characters</small></>}
-        {dialog.type === 'moderate' && <><div className="small-callout"><Icon name="info"/><p>{dialog.decision === 'removed' ? 'This marks the review as removed in the demo report. It does not delete a real Flutter review.' : 'Dismissal closes the demo report without hiding its review.'}</p></div><label className="form-label" htmlFor="moderation-note">Moderation note (required)</label><textarea id="moderation-note" className="form-control" rows={3} maxLength={800} value={note} onChange={e => setNote(e.target.value)} placeholder="Explain your decision..." /></>}
+        {dialog.type === 'moderate' && <><div className="small-callout"><Icon name="info"/><p>{dialog.decision === 'removed' ? liveAdminEnabled ? 'This will hide the review and close related reports in MySQL.' : 'This only marks the demo report removed.' : liveAdminEnabled ? 'Dismissal closes this report without hiding the review.' : 'Dismissal closes the demo report without hiding its review.'}</p></div><label className="form-label" htmlFor="moderation-note">Moderation note (required)</label><textarea id="moderation-note" className="form-control" rows={3} maxLength={800} value={note} onChange={e => setNote(e.target.value)} placeholder="Explain your decision..." /></>}
         {(dialog.type === 'approve' || dialog.type === 'revoke' || dialog.type === 'restore' || dialog.type === 'reset') && <div className="small-callout"><Icon name="alert" size={20}/><p>{dialog.type === 'approve' ? liveAdminEnabled ? 'This will approve and publish the business in MySQL.' : 'This will make the example business Approved and active in this browser only.' : dialog.type === 'revoke' ? 'This will clear the manual payment verification for this Pending request.' : dialog.type === 'restore' ? 'This will restore the example business visibility in this browser.' : 'This will discard all changes saved in this browser and restore sample data.'}</p></div>}
       </div>
       <div className="modal-actions"><button className="btn btn-outline" onClick={() => setDialog(null)}>Cancel</button><button className={`btn ${['decline','suspend','reset'].includes(dialog.type) ? 'btn-danger' : 'btn-primary'}`} onClick={confirmDialog} disabled={working || (dialog.type === 'payment' && !paymentAcknowledged)}>{dialogConfirmLabel(dialog)}</button></div>

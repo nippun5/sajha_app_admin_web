@@ -83,6 +83,10 @@ if (!result.user?.roles?.includes('ADMIN')) {
     await this.request(`/admin/business-requests/${encodeURIComponent(id)}/${endpoint}`,
       kind === 'revoke' ? 'DELETE' : 'POST', payload);
   }
+  async moderate(reportId: string, decision: 'dismissed' | 'removed', note: string): Promise<void> {
+    await this.request(`/admin/review-reports/${encodeURIComponent(reportId)}/moderate`,
+      'POST', { decision, note });
+  }
   async imageBlob(path: string): Promise<string> {
     if (!path.startsWith('/api/v1/admin/business-requests/') || !path.endsWith('/banner')) {
       throw new Error('Invalid private image path.');
